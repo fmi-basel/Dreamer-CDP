@@ -20,7 +20,7 @@ defaults:
   errfile: False
 
   logger:
-    outputs: [jsonl, scope]
+    outputs: [jsonl, scope, wandb]
     filter: 'score|length|fps|ratio|train/loss/|train/rand/'
     timer: True
     fps: 15
@@ -83,8 +83,10 @@ defaults:
     coordinator_address: ''
 
   agent:
-    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3}
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, dyn_deter: 500} 
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
+    enc_lr: 6e-6
+    dyn_lr: 4e-4
     ac_grads: False
     dyn:
       typ: rssm
@@ -108,9 +110,11 @@ defaults:
     imag_loss: {slowtar: False, lam: 0.95, actent: 3e-4, slowreg: 1.0}
     repl_loss: {slowtar: False, lam: 0.95, slowreg: 1.0}
     slowvalue: {rate: 0.02, every: 1}
+    slowenc: {rate: 0.02, every: 1, enable: False}
     retnorm: {impl: perc, rate: 0.01, limit: 1.0, perclo: 5.0, perchi: 95.0, debias: False}
     valnorm: {impl: none, rate: 0.01, limit: 1e-8}
     advnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    dec_grad: False
     reward_grad: True
     repval_loss: True
     repval_grad: True

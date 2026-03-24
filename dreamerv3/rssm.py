@@ -7,6 +7,7 @@ import embodied.jax.nets as nn
 import jax
 import jax.numpy as jnp
 import ninjax as nj
+import optax
 import numpy as np
 
 f32 = jnp.float32
@@ -31,9 +32,10 @@ class RSSM(nj.Module):
   blocks: int = 8
   free_nats: float = 1.0
 
-  def __init__(self, act_space, **kw):
+  def __init__(self, act_space, enc_output, **kw):
     assert self.deter % self.blocks == 0
     self.act_space = act_space
+    self.enc_output = enc_output
     self.kw = kw
 
   @property
@@ -58,19 +60,26 @@ class RSSM(nj.Module):
     return jax.tree.map(
         lambda x: x[:, -nlast:].reshape((B * nlast, *x.shape[2:])), entries)
 
+  def predictor(self, x):
+    for i in range(1):
+      x = self.sub(f'pred{i}', nn.Linear, self.enc_output, **self.kw)(x)
+      x = nn.act(self.act)(self.sub(f'pred{i}norm', nn.Norm, self.norm)(x))
+    x = self.sub(f'pred_out', nn.Linear, self.enc_output, **self.kw)(x)
+    return x
+
   def observe(self, carry, tokens, action, reset, training, single=False):
     carry, tokens, action = nn.cast((carry, tokens, action))
     if single:
-      carry, (entry, feat) = self._observe(
+      carry, (entry, feat, x) = self._observe(
           carry, tokens, action, reset, training)
-      return carry, entry, feat
+      return carry, entry, feat, x
     else:
       unroll = jax.tree.leaves(tokens)[0].shape[1] if self.unroll else 1
-      carry, (entries, feat) = nj.scan(
+      carry, (entries, feat, x) = nj.scan(
           lambda carry, inputs: self._observe(
               carry, *inputs, training),
           carry, (tokens, action, reset), unroll=unroll, axis=1)
-      return carry, entries, feat
+      return carry, entries, feat, x
 
   def _observe(self, carry, tokens, action, reset, training):
     deter, stoch, action = nn.mask(
@@ -89,7 +98,7 @@ class RSSM(nj.Module):
     feat = dict(deter=deter, stoch=stoch, logit=logit)
     entry = dict(deter=deter, stoch=stoch)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
-    return carry, (entry, feat)
+    return carry, (entry, feat, x)
 
   def imagine(self, carry, policy, length, training, single=False):
     if single:
@@ -117,9 +126,9 @@ class RSSM(nj.Module):
       # return carry, entries, feat, action
       return carry, feat, action
 
-  def loss(self, carry, tokens, acts, reset, training):
+  def loss(self, carry, tokens, acts, reset, training, slow_tokens=None):
     metrics = {}
-    carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
+    carry, entries, feat, x_enc = self.observe(carry, tokens, acts, reset, training)
     prior = self._prior(feat['deter'])
     post = feat['logit']
     dyn = self._dist(sg(post)).kl(self._dist(prior))
@@ -127,10 +136,14 @@ class RSSM(nj.Module):
     if self.free_nats:
       dyn = jnp.maximum(dyn, self.free_nats)
       rep = jnp.maximum(rep, self.free_nats)
-    losses = {'dyn': dyn, 'rep': rep}
+
+    pred_enc = self.predictor(feat['deter'])
+    dyn_deter = optax.losses.cosine_distance(sg(slow_tokens), pred_enc, axis=-1, epsilon=1e-8)
+
+    losses = {'dyn': dyn, 'rep': rep, 'dyn_deter': dyn_deter} 
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
-    return carry, entries, losses, feat, metrics
+    return carry, entries, losses, feat, metrics, None
 
   def _core(self, deter, stoch, action):
     stoch = stoch.reshape((stoch.shape[0], -1))
@@ -174,7 +187,6 @@ class RSSM(nj.Module):
     out = embodied.jax.outs.OneHot(logits, self.unimix)
     out = embodied.jax.outs.Agg(out, 1, jnp.sum)
     return out
-
 
 class Encoder(nj.Module):
 
@@ -243,11 +255,40 @@ class Encoder(nj.Module):
       assert 3 <= x.shape[-2] <= 16, x.shape
       x = x.reshape((x.shape[0], -1))
       outs.append(x)
-
+      
     x = jnp.concatenate(outs, -1)
     tokens = x.reshape((*bshape, *x.shape[1:]))
     entries = {}
     return carry, entries, tokens
+
+  def calculate_encoder_output_dim(self, obs_space, encoder_config):
+    """
+    Simplified version that calculates encoder output dimension.
+    """
+    depth = encoder_config.get('depth', 64)
+    mults = encoder_config.get('mults', (2,3,4,4))
+    
+    imgkeys = [k for k, s in obs_space.items() if len(s.shape) == 3]
+    veckeys = [k for k, s in obs_space.items() if len(s.shape) <= 2]
+    
+    total_dim = 0
+    
+    # Image part - calculate flattened CNN output
+    if veckeys:
+      total_dim = self.units
+    if imgkeys:
+        total_dim = 0
+        # Assume square images for simplicity (can be extended)
+        img_size = obs_space[imgkeys[0]].shape[0]  # e.g., 64 for (64,64,3)
+        
+        # After len(mults) layers of 2x downsampling
+        final_spatial_size = img_size // (2 ** len(mults))  # 64 // 16 = 4
+        final_depth = depth * mults[-1]  # 64 * 4 = 256
+        
+        img_dim = final_spatial_size * final_spatial_size * final_depth
+        total_dim += img_dim
+    print("Encoder output dimension:", int(total_dim))
+    return int(total_dim)
 
 
 class Decoder(nj.Module):

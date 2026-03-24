@@ -20,7 +20,6 @@ prefix = lambda xs, p: {f'{p}/{k}': v for k, v in xs.items()}
 concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
 isimage = lambda s: s.dtype == np.uint8 and len(s.shape) == 3
 
-
 class Agent(embodied.jax.Agent):
 
   banner = [
@@ -41,16 +40,24 @@ class Agent(embodied.jax.Agent):
     self.enc = {
         'simple': rssm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
+
+    self.enc_output_dim = self.enc.calculate_encoder_output_dim(obs_space, config.enc)
+
+    if hasattr(config, 'slowenc') and config.slowenc.enable:
+        self.slowenc = embodied.jax.SlowModel(
+            self.enc, source=self.enc, **config.slowenc, name='slowenc')
+    else:
+        self.slowenc = None
+
     self.dyn = {
         'rssm': rssm.RSSM,
-    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
-    self.dec = {
-        'simple': rssm.Decoder,
-    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
-
+    }[config.dyn.typ](act_space, self.enc_output_dim, **config.dyn[config.dyn.typ], name='dyn')
     self.feat2tensor = lambda x: jnp.concatenate([
         nn.cast(x['deter']),
         nn.cast(x['stoch'].reshape((*x['stoch'].shape[:-2], -1)))], -1)
+    self.dec = {
+        'simple': rssm.Decoder,
+    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
 
     scalar = elements.Space(np.float32, ())
     binary = elements.Space(bool, (), 0, 2)
@@ -73,9 +80,43 @@ class Agent(embodied.jax.Agent):
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+
+    if hasattr(config, 'enc_lr') or hasattr(config, 'dyn_lr'):
+
+        enc_lr = getattr(config, 'enc_lr', config.opt.lr)
+        dyn_lr = getattr(config, 'dyn_lr', config.opt.lr)
+        
+        def label_fn(params):
+            labels = {}
+            for name in params.keys():
+                if name.startswith('enc/'):
+                    labels[name] = 'enc'
+                elif name.startswith('dyn/'):
+                    labels[name] = 'dyn'
+                else:
+                    labels[name] = 'other'
+            return labels
+        
+        enc_opt_config = dict(config.opt)
+        enc_opt_config['lr'] = enc_lr
+        
+        dyn_opt_config = dict(config.opt)
+        dyn_opt_config['lr'] = dyn_lr
+        dyn_opt_config['schedule'] = 'const'
+        #dyn_opt_config['anneal'] = 100000
+        
+        optimizer = optax.multi_transform({
+            'enc': self._make_opt(**enc_opt_config),
+            'dyn': self._make_opt(**dyn_opt_config),
+            'other': self._make_opt(**config.opt),
+        }, label_fn)
+        
+    else:
+        optimizer = self._make_opt(**config.opt)
+    
     self.opt = embodied.jax.Optimizer(
-        self.modules, self._make_opt(**config.opt), summary_depth=1,
-        name='opt')
+        self.modules, optimizer, summary_depth=1, name='opt')
+
 
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
@@ -84,7 +125,7 @@ class Agent(embodied.jax.Agent):
 
   @property
   def policy_keys(self):
-    return '^(enc|dyn|dec|pol)/'
+    return '^(enc|dyn|dec|pol|rew|val|con)/'
 
   @property
   def ext_space(self):
@@ -117,12 +158,14 @@ class Agent(embodied.jax.Agent):
     kw = dict(training=False, single=True)
     reset = obs['is_first']
     enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
-    dyn_carry, dyn_entry, feat = self.dyn.observe(
+    dyn_carry, dyn_entry, feat,_ = self.dyn.observe(
         dyn_carry, tokens, prevact, reset, **kw)
     dec_entry = {}
-    if dec_carry:
-      dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
+    dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
     policy = self.pol(self.feat2tensor(feat), bdims=1)
+    rew = self.rew(self.feat2tensor(feat), bdims=1).pred()
+    val = self.val(self.feat2tensor(feat), bdims=1).pred()
+    con = self.con(self.feat2tensor(feat), bdims=1).prob(1)
     act = sample(policy)
     out = {}
     out['finite'] = elements.tree.flatdict(jax.tree.map(
@@ -132,14 +175,25 @@ class Agent(embodied.jax.Agent):
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
           enc=enc_entry, dyn=dyn_entry, dec=dec_entry)))
+    else:
+      recons_pred = {}
+      for key, recon in recons.items():
+        if hasattr(recon, 'pred'):
+          recons_pred[key] = recon.pred()
+        else:
+          recons_pred[key] = recon
+      out.update(elements.tree.flatdict(dict(
+          enc=enc_entry, dyn=dyn_entry, dec=dec_entry, rew=rew, val=val, con=con, recons=recons_pred)))
     return carry, act, out
 
   def train(self, carry, data):
     carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
-    metrics, (carry, entries, outs, mets) = self.opt(
+    metrics, (carry, entries, outs, mets, replay_loss) = self.opt(
         self.loss, carry, obs, prevact, training=True, has_aux=True)
     metrics.update(mets)
     self.slowval.update()
+    if self.slowenc is not None:
+      self.slowenc.update()
     outs = {}
     if self.config.replay_context:
       updates = elements.tree.flatdict(dict(
@@ -155,7 +209,7 @@ class Agent(embodied.jax.Agent):
 
   def loss(self, carry, obs, prevact, training):
     enc_carry, dyn_carry, dec_carry = carry
-    reset = obs['is_first']
+    reset = obs['is_first']    
     B, T = reset.shape
     losses = {}
     metrics = {}
@@ -163,12 +217,15 @@ class Agent(embodied.jax.Agent):
     # World model
     enc_carry, enc_entries, tokens = self.enc(
         enc_carry, obs, reset, training)
-    dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
-        dyn_carry, tokens, prevact, reset, training)
+    if self.slowenc is not None:
+      _, _, slow_tokens = self.slowenc(enc_carry, obs, reset, training)
+    dyn_carry, dyn_entries, los, repfeat, mets, _ = self.dyn.loss(
+        dyn_carry, tokens, prevact, reset, training, slow_tokens=(slow_tokens if self.slowenc is not None else tokens))
+    
     losses.update(los)
     metrics.update(mets)
     dec_carry, dec_entries, recons = self.dec(
-        dec_carry, repfeat, reset, training)
+        dec_carry, jax.tree.map(lambda x: sg(x, skip=self.config.dec_grad), repfeat), reset, training)
     inp = sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
     losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
     con = f32(~obs['is_terminal'])
@@ -233,7 +290,7 @@ class Agent(embodied.jax.Agent):
           **self.config.repl_loss)
       losses.update(los)
       metrics.update(prefix(mets, 'reploss'))
-
+      
     assert set(losses.keys()) == set(self.scales.keys()), (
         sorted(losses.keys()), sorted(self.scales.keys()))
     metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
@@ -242,7 +299,7 @@ class Agent(embodied.jax.Agent):
     carry = (enc_carry, dyn_carry, dec_carry)
     entries = (enc_entries, dyn_entries, dec_entries)
     outs = {'tokens': tokens, 'repfeat': repfeat, 'losses': losses}
-    return loss, (carry, entries, outs, metrics)
+    return loss, (carry, entries, outs, metrics, losses['dyn_deter'])
 
   def report(self, carry, data):
     if not self.config.report:
@@ -255,7 +312,7 @@ class Agent(embodied.jax.Agent):
     metrics = {}
 
     # Train metrics
-    _, (new_carry, entries, outs, mets) = self.loss(
+    _, (new_carry, entries, outs, mets, _) = self.loss(
         carry, obs, prevact, training=False)
     mets.update(mets)
 
@@ -275,7 +332,7 @@ class Agent(embodied.jax.Agent):
     secondhalf = lambda xs: jax.tree.map(lambda x: x[:RB, T // 2:], xs)
     dyn_carry = jax.tree.map(lambda x: x[:RB], dyn_carry)
     dec_carry = jax.tree.map(lambda x: x[:RB], dec_carry)
-    dyn_carry, _, obsfeat = self.dyn.observe(
+    dyn_carry, _, obsfeat,_ = self.dyn.observe(
         dyn_carry, firsthalf(outs['tokens']), firsthalf(prevact),
         firsthalf(obs['is_first']), training=False)
     _, imgfeat, _ = self.dyn.imagine(
@@ -377,6 +434,93 @@ class Agent(embodied.jax.Agent):
       sched = optax.join_schedules([ramp, sched], [warmup])
     chain.append(optax.scale_by_learning_rate(sched))
     return optax.chain(*chain)
+  
+  def _make_multi_lr_opt(
+      self,
+      lr: float = 4e-5,
+      enc_lr: float = 1e-4,
+      dyn_lr: float = 4e-5,
+      agc: float = 0.3,
+      eps: float = 1e-20,
+      beta1: float = 0.9,
+      beta2: float = 0.999,
+      momentum: bool = True,
+      nesterov: bool = False,
+      wd: float = 0.0,
+      wdregex: str = r'/kernel$',
+      schedule: str = 'const',
+      warmup: int = 1000,
+      anneal: int = 0,
+  ):
+      """Create optimizer with different learning rates for different modules."""
+      
+      def lr_fn(params):
+          """Return learning rate based on parameter name."""
+          def get_lr(name):
+              if name.startswith('enc/'):
+                  return enc_lr
+              elif name.startswith('dyn/'):
+                  return dyn_lr
+              else:
+                  return lr
+          return {k: get_lr(k) for k in params}
+      
+      # Create base transformations
+      chain = []
+      chain.append(embodied.jax.opt.clip_by_agc(agc))
+      chain.append(embodied.jax.opt.scale_by_rms(beta2, eps))
+      chain.append(embodied.jax.opt.scale_by_momentum(beta1, nesterov))
+      
+      if wd:
+          assert not wdregex[0].isnumeric(), wdregex
+          pattern = re.compile(wdregex)
+          wdmask = lambda params: {k: bool(pattern.search(k)) for k in params}
+          chain.append(optax.add_decayed_weights(wd, wdmask))
+      
+      # Create schedule
+      assert anneal > 0 or schedule == 'const'
+      if schedule == 'const':
+          sched = lambda lr_val: optax.constant_schedule(lr_val)
+      elif schedule == 'linear':
+          sched = lambda lr_val: optax.linear_schedule(lr_val, 0.1 * lr_val, anneal - warmup)
+      elif schedule == 'cosine':
+          sched = lambda lr_val: optax.cosine_decay_schedule(lr_val, anneal - warmup, 0.1 * lr_val)
+      else:
+          raise NotImplementedError(schedule)
+      
+      # Create multi-learning rate optimizer
+      def multi_lr_scale(lr_dict):
+          def init_fn(params):
+              return {}
+          
+          def update_fn(updates, state, params):
+              scaled_updates = {}
+              for k, update in updates.items():
+                  lr_val = lr_dict[k]
+                  if warmup:
+                      ramp = optax.linear_schedule(0.0, lr_val, warmup)
+                      full_sched = optax.join_schedules([ramp, sched(lr_val)], [warmup])
+                  else:
+                      full_sched = sched(lr_val)
+                  
+                  # Apply the learning rate schedule
+                  step = state.get('step', 0)
+                  current_lr = full_sched(step)
+                  scaled_updates[k] = update * current_lr
+              
+              new_state = {'step': state.get('step', 0) + 1}
+              return scaled_updates, new_state
+          
+          return optax.GradientTransformation(init_fn, update_fn)
+      
+      # Wrap the multi-lr transformation
+      def create_optimizer(params):
+          lr_dict = lr_fn(params)
+          base_chain = optax.chain(*chain)
+          multi_lr_transform = multi_lr_scale(lr_dict)
+          return optax.chain(base_chain, multi_lr_transform)
+      
+      return create_optimizer
 
 
 def imag_loss(

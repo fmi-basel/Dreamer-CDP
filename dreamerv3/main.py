@@ -273,4 +273,10 @@ def make_stream(config, replay, mode):
 
 
 if __name__ == '__main__':
+  try:
+    import wandb
+    print(f"WandB version: {wandb.__version__}")
+    print(f"WandB init available: {hasattr(wandb, 'init')}")
+  except ImportError as e:
+      print(f"WandB import failed: {e}")
   main()
